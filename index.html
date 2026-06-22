@@ -4,6 +4,29 @@
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>Chord Transposer</title>
+<meta name="description" content="Transpose chord sheets to any key, instantly. Paste your chords, pick a key or nudge by semitones, and copy the result.">
+<meta name="theme-color" content="#0a0a0f">
+
+<!-- Icons -->
+<link rel="icon" type="image/svg+xml" href="favicon.svg">
+<link rel="icon" type="image/png" sizes="48x48" href="favicon.png">
+<link rel="apple-touch-icon" href="apple-touch-icon.png">
+
+<!-- Open Graph (set absolute URLs once the site has a fixed domain for richest previews) -->
+<meta property="og:type" content="website">
+<meta property="og:title" content="Chord Transposer">
+<meta property="og:description" content="Transpose chord sheets to any key, instantly — paste · pick · play.">
+<meta property="og:image" content="og-image.png">
+<meta property="og:image:width" content="1200">
+<meta property="og:image:height" content="630">
+<meta property="og:image:alt" content="Chord Transposer — transpose chord sheets to any key">
+
+<!-- Twitter -->
+<meta name="twitter:card" content="summary_large_image">
+<meta name="twitter:title" content="Chord Transposer">
+<meta name="twitter:description" content="Transpose chord sheets to any key, instantly — paste · pick · play.">
+<meta name="twitter:image" content="og-image.png">
+
 <link href="https://fonts.googleapis.com/css2?family=Bebas+Neue&family=DM+Mono:wght@300;400;500&display=swap" rel="stylesheet">
 <style>
   :root {
@@ -361,219 +384,238 @@
 </div>
 
 <script>
-// ── Music data ──
-const SHARPS = ['C','C#','D','D#','E','F','F#','G','G#','A','A#','B'];
-const FLATS  = ['C','Db','D','Eb','E','F','Gb','G','Ab','A','Bb','B'];
-const ENHARMONIC = { 'C#':'Db','Db':'C#','D#':'Eb','Eb':'D#','F#':'Gb','Gb':'F#','G#':'Ab','Ab':'G#','A#':'Bb','Bb':'A#' };
+/*
+ * Chord Transposer
+ * ----------------
+ * Wrapped in an IIFE (strict mode) so nothing leaks to the global scope.
+ * Two clearly separated layers:
+ *   1. PURE CORE   – music-theory functions; no DOM, fully testable.
+ *   2. VIEW / WIRING – cached DOM refs, a single render(), event handlers.
+ */
+(function () {
+  'use strict';
 
-// Display keys
-const KEYS = [
-  'C','C#','Db','D','D#','Eb','E','F','F#','Gb','G','G#','Ab','A','A#','Bb','B'
-];
+  /* ───────────────────────── Music data & constants ───────────────────────── */
+  const SHARPS = ['C','C#','D','D#','E','F','F#','G','G#','A','A#','B'];
+  const FLATS  = ['C','Db','D','Eb','E','F','Gb','G','Ab','A','Bb','B'];
 
-// Strict chord grammar: a root, followed only by recognised chord-quality
-// atoms, with an optional slash-bass note. Anchored end-to-end so ordinary
-// words that merely start with A–G (e.g. "Capo", "Bridge", "Cast") are NOT
-// mistaken for chords.
-const ROOT_RE = '[A-G][#b]?';
-const CHORD_SUFFIX =
-  '(?:maj|min|sus|add|aug|dim|hdim|alt|M|m|°|ø|Δ|\\+|13|11|9|7|6|5|4|2|b5|#5|b9|#9|#11|b13|b6)';
-const STRICT_CHORD_RE = new RegExp('^' + ROOT_RE + CHORD_SUFFIX + '*(?:/' + ROOT_RE + ')?$');
+  // Keys shown in the From/To pickers.
+  const KEYS = [
+    'C','C#','Db','D','D#','Eb','E','F','F#','Gb','G','G#','Ab','A','A#','Bb','B'
+  ];
 
-function noteIndex(note) {
-  let i = SHARPS.indexOf(note);
-  if (i < 0) i = FLATS.indexOf(note);
-  return i;
-}
+  // Keys whose conventional spelling uses flats.
+  const FLAT_KEYS = ['F','Bb','Eb','Ab','Db','Gb'];
 
-function bestNote(idx, useFlat) {
-  return useFlat ? FLATS[idx] : SHARPS[idx];
-}
+  const OCTAVE = 12;             // semitones per octave
+  const TRITONE = 6;            // half an octave — pivot for choosing transposition direction
+  const CHORD_LINE_RATIO = 0.5; // ≥ this fraction of chord tokens ⇒ treat the line as a chord line
+  const COPY_RESET_MS = 1800;   // how long the "DONE!" copy confirmation stays up
 
-function preferFlat(key) {
-  return ['F','Bb','Eb','Ab','Db','Gb'].includes(key);
-}
+  /*
+   * Single source of truth for chord matching.
+   *  - STRICT_CHORD_RE validates a *whole* token: root + recognised quality
+   *    atoms + optional slash bass, anchored end-to-end. This keeps ordinary
+   *    words that merely start with A–G (e.g. "Capo", "Bridge") from being
+   *    mistaken for chords.
+   *  - CHORD_CANDIDATE_RE finds chord-shaped substrings inside lyric lines;
+   *    every hit is then re-validated with parseChord().
+   */
+  const ROOT = '[A-G][#b]?';
+  const CHORD_SUFFIX =
+    '(?:maj|min|sus|add|aug|dim|hdim|alt|M|m|°|ø|Δ|\\+|13|11|9|7|6|5|4|2|b5|#5|b9|#9|#11|b13|b6)';
+  const STRICT_CHORD_RE = new RegExp('^(' + ROOT + ')' + CHORD_SUFFIX + '*(?:/' + ROOT + ')?$');
+  const CHORD_CANDIDATE_RE =
+    /\b([A-G][#b]?(?:m(?:aj)?7?|maj7?|7|9|11|13|sus[24]?|add9|dim7?|aug|6|b5|#5|\+)?(?:\/[A-Gb#]{1,2}b?)?)\b/g;
 
-// Parse a single chord token → {root, suffix} or null.
-// Rejects the token entirely unless it matches the strict chord grammar, so
-// lyric/marker words are never transposed.
-function parseChord(token) {
-  if (!STRICT_CHORD_RE.test(token)) return null;
-  const m = token.match(/^([A-G][#b]?)(.*)$/);
-  const root = m[1];
-  const suffix = m[2];
-  if (noteIndex(root) < 0) return null;
-  return { root, suffix };
-}
+  /* ─────────────────────────────── Pure core ──────────────────────────────── */
+  const escHtml = (s) => s.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
 
-// Regex that matches chord-like tokens
-const CHORD_RE = /\b([A-G][#b]?(?:m(?:aj)?7?|maj7?|7|9|11|13|sus[24]?|add9|dim7?|aug|6|b5|#5|\+|°|ø|hdim)?(?:\/[A-Gb#]{1,2}b?)?)\b/g;
-
-function transposeChord(token, semitones, useFlat) {
-  // handle slash chords
-  const slashMatch = token.match(/^([A-G][#b]?.*?)\/([A-G][#b]?)$/);
-  if (slashMatch) {
-    const top = transposeChord(slashMatch[1], semitones, useFlat);
-    const bot = transposeChord(slashMatch[2], semitones, useFlat);
-    return top + '/' + bot;
+  // Chromatic index 0–11 for a note, or -1 for spellings we don't represent (Cb, E#, …).
+  function noteIndex(note) {
+    const i = SHARPS.indexOf(note);
+    return i < 0 ? FLATS.indexOf(note) : i;
   }
-  const parsed = parseChord(token);
-  if (!parsed) return token;
-  const idx = noteIndex(parsed.root);
-  if (idx < 0) return token;
-  const newIdx = ((idx + semitones) % 12 + 12) % 12;
-  return bestNote(newIdx, useFlat) + parsed.suffix;
-}
 
-// Transpose entire text
-function transposeText(text, semitones, toKey) {
-  const useFlat = toKey ? preferFlat(toKey) : false;
-  if (semitones === 0) return { html: escHtml(text), plain: text };
+  const bestNote = (idx, useFlat) => (useFlat ? FLATS[idx] : SHARPS[idx]);
+  const preferFlat = (key) => FLAT_KEYS.includes(key);
 
-  // Split into lines, process tokens
-  const lines = text.split('\n');
-  const htmlLines = [];
-  const plainLines = [];
+  // Parse a single token → { root, suffix } or null. A token is a chord only if
+  // it matches the strict grammar AND its root is a representable note.
+  function parseChord(token) {
+    const m = STRICT_CHORD_RE.exec(token);
+    if (!m) return null;
+    const root = m[1];
+    if (noteIndex(root) < 0) return null;
+    return { root, suffix: token.slice(root.length) };
+  }
 
-  for (const line of lines) {
-    // Detect chord lines: >50% tokens are chords
-    const tokens = line.split(/(\s+)/);
-    let chordCount = 0, wordCount = 0;
-    for (const t of tokens) {
-      if (!t.trim()) continue;
-      wordCount++;
-      if (parseChord(t)) chordCount++;
+  function transposeChord(token, semitones, useFlat) {
+    // Slash chords: transpose the upper chord and the bass note independently.
+    const slash = token.match(/^([A-G][#b]?.*?)\/([A-G][#b]?)$/);
+    if (slash) {
+      return transposeChord(slash[1], semitones, useFlat) + '/' +
+             transposeChord(slash[2], semitones, useFlat);
     }
-    const isChordLine = wordCount > 0 && chordCount / wordCount >= 0.5;
+    const parsed = parseChord(token);
+    if (!parsed) return token;
+    const idx = noteIndex(parsed.root);
+    if (idx < 0) return token;
+    const newIdx = ((idx + semitones) % OCTAVE + OCTAVE) % OCTAVE;
+    return bestNote(newIdx, useFlat) + parsed.suffix;
+  }
 
-    if (isChordLine) {
-      const htmlParts = [];
-      const plainParts = [];
+  // Transpose a whole sheet. Returns { html, plain } so the view can render
+  // highlighted output while the copy button gets clean text.
+  function transposeText(text, semitones, toKey) {
+    const useFlat = toKey ? preferFlat(toKey) : false;
+    if (semitones === 0) return { html: escHtml(text), plain: text };
+
+    const htmlLines = [];
+    const plainLines = [];
+
+    for (const line of text.split('\n')) {
+      const tokens = line.split(/(\s+)/);
+
+      // A line is a "chord line" when most of its words parse as chords.
+      let chordCount = 0, wordCount = 0;
       for (const t of tokens) {
-        if (!t.trim()) { htmlParts.push(t); plainParts.push(t); continue; }
-        const parsed = parseChord(t);
-        if (parsed) {
+        if (!t.trim()) continue;
+        wordCount++;
+        if (parseChord(t)) chordCount++;
+      }
+      const isChordLine = wordCount > 0 && chordCount / wordCount >= CHORD_LINE_RATIO;
+
+      if (isChordLine) {
+        // Transpose every chord token; pass whitespace and non-chords through.
+        const html = [];
+        const plain = [];
+        for (const t of tokens) {
+          if (!t.trim() || !parseChord(t)) {
+            html.push(escHtml(t));
+            plain.push(t);
+            continue;
+          }
           const transposed = transposeChord(t, semitones, useFlat);
-          htmlParts.push(`<span class="chord-token">${escHtml(transposed)}</span>`);
-          plainParts.push(transposed);
-        } else {
-          htmlParts.push(escHtml(t));
-          plainParts.push(t);
+          html.push(`<span class="chord-token">${escHtml(transposed)}</span>`);
+          plain.push(transposed);
         }
+        htmlLines.push(html.join(''));
+        plainLines.push(plain.join(''));
+      } else {
+        // Lyric line: only replace chord-shaped substrings that re-validate.
+        let html = '';
+        let plain = '';
+        let last = 0;
+        for (const m of line.matchAll(CHORD_CANDIDATE_RE)) {
+          if (!parseChord(m[1])) continue;
+          const before = line.slice(last, m.index);
+          const transposed = transposeChord(m[1], semitones, useFlat);
+          html += escHtml(before) + `<span class="chord-token">${escHtml(transposed)}</span>`;
+          plain += before + transposed;
+          last = m.index + m[0].length;
+        }
+        html += escHtml(line.slice(last));
+        plain += line.slice(last);
+        htmlLines.push(html);
+        plainLines.push(plain);
       }
-      htmlLines.push(htmlParts.join(''));
-      plainLines.push(plainParts.join(''));
+    }
+    return { html: htmlLines.join('\n'), plain: plainLines.join('\n') };
+  }
+
+  /* ───────────────────────────── View / state ─────────────────────────────── */
+  const dom = {
+    input:  document.getElementById('inputArea'),
+    output: document.getElementById('outputText'),
+    semi:   document.getElementById('semiDisplay'),
+    tag:    document.getElementById('resultTag'),
+    copy:   document.getElementById('copyBtn'),
+    up:     document.getElementById('upBtn'),
+    down:   document.getElementById('downBtn'),
+    reset:  document.getElementById('resetBtn'),
+  };
+
+  const state = { fromKey: null, toKey: null, manualSemitones: 0 };
+  let outputPlain = ''; // clean text mirror of the rendered output, for copying
+
+  // Net shift = shortest path between the two keys (if both set) + manual offset.
+  function totalSemitones() {
+    let base = 0;
+    if (state.fromKey && state.toKey) {
+      const fi = noteIndex(state.fromKey), ti = noteIndex(state.toKey);
+      if (fi >= 0 && ti >= 0) base = ((ti - fi) % OCTAVE + OCTAVE) % OCTAVE;
+      if (base > TRITONE) base -= OCTAVE; // prefer the shorter direction
+    }
+    return base + state.manualSemitones;
+  }
+
+  function render() {
+    const semi = totalSemitones();
+    const { html, plain } = transposeText(dom.input.value, semi, state.toKey || state.fromKey);
+    dom.output.innerHTML = html;
+    outputPlain = plain;
+
+    dom.semi.textContent = (semi >= 0 ? '+' : '') + semi + ' st';
+    if (state.toKey) {
+      dom.tag.textContent = state.toKey;
+    } else if (semi !== 0) {
+      dom.tag.textContent = (semi > 0 ? '+' : '') + semi + ' semitone' + (Math.abs(semi) !== 1 ? 's' : '');
     } else {
-      // Inline chord replacement within lyrics like "Am F C G"
-      let htmlLine = '';
-      let plainLine = '';
-      let last = 0;
-      const re = /\b([A-G][#b]?(?:m(?:aj)?7?|maj7?|7|9|11|13|sus[24]?|add9|dim7?|aug|6|b5|#5|\+)?(?:\/[A-Gb#]{1,2}b?)?)\b/g;
-      let rm;
-      re.lastIndex = 0;
-      // Only replace tokens that are valid chords
-      const segments = [];
-      while ((rm = re.exec(line)) !== null) {
-        if (parseChord(rm[1])) segments.push({ start: rm.index, end: rm.index + rm[0].length, val: rm[1] });
-      }
-      last = 0;
-      for (const seg of segments) {
-        const before = line.slice(last, seg.start);
-        const transposed = transposeChord(seg.val, semitones, useFlat);
-        htmlLine += escHtml(before) + `<span class="chord-token">${escHtml(transposed)}</span>`;
-        plainLine += before + transposed;
-        last = seg.end;
-      }
-      htmlLine += escHtml(line.slice(last));
-      plainLine += line.slice(last);
-      htmlLines.push(htmlLine);
-      plainLines.push(plainLine);
+      dom.tag.textContent = '—';
     }
   }
-  return { html: htmlLines.join('\n'), plain: plainLines.join('\n') };
-}
 
-function escHtml(s) {
-  return s.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
-}
-
-// ── State ──
-let fromKey = null;
-let toKey = null;
-let manualSemitones = 0;
-
-function totalSemitones() {
-  let base = 0;
-  if (fromKey && toKey) {
-    const fi = noteIndex(fromKey), ti = noteIndex(toKey);
-    if (fi >= 0 && ti >= 0) base = ((ti - fi) % 12 + 12) % 12;
-    if (base > 6) base -= 12; // shortest path
+  /* ───────────────────────────── Key grids ────────────────────────────────── */
+  function buildGrid(id, type) {
+    const grid = document.getElementById(id);
+    for (const k of KEYS) {
+      const btn = document.createElement('button');
+      btn.className = 'key-btn';
+      btn.textContent = k;
+      btn.dataset.key = k;
+      btn.addEventListener('click', () => {
+        grid.querySelectorAll('.key-btn').forEach((b) => b.classList.remove('active'));
+        btn.classList.add('active');
+        if (type === 'from') {
+          state.fromKey = k;
+        } else {
+          state.toKey = k;
+          state.manualSemitones = 0;
+        }
+        render();
+      });
+      grid.appendChild(btn);
+    }
   }
-  return base + manualSemitones;
-}
 
-function render() {
-  const text = document.getElementById('inputArea').value;
-  const semi = totalSemitones();
-  const { html, plain } = transposeText(text, semi, toKey || fromKey);
-  document.getElementById('outputText').innerHTML = html;
-  window._outputPlain = plain;
+  buildGrid('fromGrid', 'from');
+  buildGrid('toGrid', 'to');
 
-  const st = semi;
-  document.getElementById('semiDisplay').textContent = (st >= 0 ? '+' : '') + st + ' st';
-  const tag = document.getElementById('resultTag');
-  if (toKey) tag.textContent = toKey;
-  else if (st !== 0) tag.textContent = (st > 0 ? '+' : '') + st + ' semitone' + (Math.abs(st) !== 1 ? 's' : '');
-  else tag.textContent = '—';
-}
+  /* ───────────────────────────── Controls ─────────────────────────────────── */
+  dom.up.addEventListener('click', () => { state.manualSemitones++; render(); });
+  dom.down.addEventListener('click', () => { state.manualSemitones--; render(); });
+  dom.reset.addEventListener('click', () => {
+    state.manualSemitones = 0;
+    state.fromKey = null;
+    state.toKey = null;
+    document.querySelectorAll('.key-btn').forEach((b) => b.classList.remove('active'));
+    render();
+  });
+  dom.input.addEventListener('input', render);
 
-// ── Key Grids ──
-function buildGrid(id, type) {
-  const grid = document.getElementById(id);
-  KEYS.forEach(k => {
-    const btn = document.createElement('button');
-    btn.className = 'key-btn';
-    btn.textContent = k;
-    btn.dataset.key = k;
-    btn.addEventListener('click', () => {
-      grid.querySelectorAll('.key-btn').forEach(b => b.classList.remove('active'));
-      btn.classList.add('active');
-      if (type === 'from') { fromKey = k; }
-      else { toKey = k; manualSemitones = 0; }
-      render();
+  dom.copy.addEventListener('click', () => {
+    const text = outputPlain || dom.output.innerText;
+    navigator.clipboard.writeText(text).then(() => {
+      dom.copy.textContent = 'DONE!';
+      dom.copy.classList.add('copied');
+      setTimeout(() => { dom.copy.textContent = 'COPY'; dom.copy.classList.remove('copied'); }, COPY_RESET_MS);
     });
-    grid.appendChild(btn);
   });
-}
 
-buildGrid('fromGrid', 'from');
-buildGrid('toGrid', 'to');
-
-// ── Controls ──
-document.getElementById('upBtn').addEventListener('click', () => { manualSemitones++; render(); });
-document.getElementById('downBtn').addEventListener('click', () => { manualSemitones--; render(); });
-document.getElementById('resetBtn').addEventListener('click', () => {
-  manualSemitones = 0;
-  fromKey = null; toKey = null;
-  document.querySelectorAll('.key-btn').forEach(b => b.classList.remove('active'));
+  // Initial paint
   render();
-});
-
-document.getElementById('inputArea').addEventListener('input', render);
-
-// ── Copy ──
-document.getElementById('copyBtn').addEventListener('click', () => {
-  const text = window._outputPlain || document.getElementById('outputText').innerText;
-  navigator.clipboard.writeText(text).then(() => {
-    const btn = document.getElementById('copyBtn');
-    btn.textContent = 'DONE!';
-    btn.classList.add('copied');
-    setTimeout(() => { btn.textContent = 'COPY'; btn.classList.remove('copied'); }, 1800);
-  });
-});
-
-// Initial render
-render();
+})();
 </script>
 </body>
 </html>
