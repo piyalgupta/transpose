@@ -371,8 +371,14 @@ const KEYS = [
   'C','C#','Db','D','D#','Eb','E','F','F#','Gb','G','G#','Ab','A','A#','Bb','B'
 ];
 
-// Chord suffix patterns to preserve
-const SUFFIXES = /^(m(?:aj)?7?|maj7?|7|9|11|13|sus[24]?|add9|dim7?|aug|6|b5|#5|\+|°|ø|hdim|\/[A-Gb#]{1,2}b?|b[0-9]|#[0-9])*/;
+// Strict chord grammar: a root, followed only by recognised chord-quality
+// atoms, with an optional slash-bass note. Anchored end-to-end so ordinary
+// words that merely start with A–G (e.g. "Capo", "Bridge", "Cast") are NOT
+// mistaken for chords.
+const ROOT_RE = '[A-G][#b]?';
+const CHORD_SUFFIX =
+  '(?:maj|min|sus|add|aug|dim|hdim|alt|M|m|°|ø|Δ|\\+|13|11|9|7|6|5|4|2|b5|#5|b9|#9|#11|b13|b6)';
+const STRICT_CHORD_RE = new RegExp('^' + ROOT_RE + CHORD_SUFFIX + '*(?:/' + ROOT_RE + ')?$');
 
 function noteIndex(note) {
   let i = SHARPS.indexOf(note);
@@ -388,10 +394,12 @@ function preferFlat(key) {
   return ['F','Bb','Eb','Ab','Db','Gb'].includes(key);
 }
 
-// Parse a single chord token → {root, suffix} or null
+// Parse a single chord token → {root, suffix} or null.
+// Rejects the token entirely unless it matches the strict chord grammar, so
+// lyric/marker words are never transposed.
 function parseChord(token) {
-  const m = token.match(/^([A-G][#b]?)(.*)/);
-  if (!m) return null;
+  if (!STRICT_CHORD_RE.test(token)) return null;
+  const m = token.match(/^([A-G][#b]?)(.*)$/);
   const root = m[1];
   const suffix = m[2];
   if (noteIndex(root) < 0) return null;
